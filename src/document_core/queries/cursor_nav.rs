@@ -2301,7 +2301,6 @@ impl DocumentCore {
                 if let Some((lh, rh)) = cursor_pair {
                     debug_assert_eq!(lh.page, rh.page);
                     last_segment_page = Some(lh.page);
-                    let partial_start = range_start > line_char_start;
 
                     let selection_continues = cell_target.is_none()
                         && ((range_end < sel_end) ||
@@ -2309,24 +2308,20 @@ impl DocumentCore {
                         // 같은 문단 내 강제 줄바꿈: 줄 끝까지 선택되고 다음 줄 시작이 sel_end이면 확장
                         (range_end == sel_end && range_end >= line_char_end && line_idx + 1 < line_count));
 
-                    let (area_left, area_right) = if cell_target.is_none() {
+                    let (_, area_right) = if cell_target.is_none() {
                         find_column_area(rh.page, rh.x)
                     } else {
                         (0.0, 0.0)
                     };
 
+                    // 줄 첫 글자부터의 선택도 캐럿(getCursorRect)과 같은 lh.x 에서 시작한다.
+                    // 단 왼쪽 끝에서 시작하면 번호·글머리표 폭, 문단 왼쪽 여백·들여쓰기, 가운데/오른쪽
+                    // 정렬로 밀린 거리만큼 글자보다 왼쪽을 칠해 캐럿과 어긋난다.
                     // y/h는 항상 left_hit 기준 (right_hit가 다음 줄에 있을 수 있음)
-                    let (page_idx, rect_x, rect_y, rect_h) =
-                        if !partial_start && cell_target.is_none() {
-                            (lh.page, area_left, lh.y, lh.h)
-                        } else {
-                            (lh.page, lh.x, lh.y, lh.h)
-                        };
+                    let (page_idx, rect_x, rect_y, rect_h) = (lh.page, lh.x, lh.y, lh.h);
 
                     let width = if selection_continues {
                         (area_right - rect_x).max(0.0)
-                    } else if !partial_start && cell_target.is_none() {
-                        (rh.x - rect_x).max(0.0)
                     } else {
                         (rh.x - lh.x).abs()
                     };
