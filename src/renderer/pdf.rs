@@ -1653,6 +1653,65 @@ endbfchar <DB80DEB1>";
         assert_eq!(chain, "'Custom Math', 'Fallback Math', serif");
     }
 
+    /// 해독할 수 없는 PNG·GIF 한 장이 PDF 전체를 `InvalidImage` 로 죽이지 않는다.
+    ///
+    /// usvg 는 머리말만 읽어 크기를 확인하므로 머리말이 온전한 잘린 그림은 통과하고, svg2pdf 가
+    /// 본문을 해독하다 실패한다. 그 그림만 건너뛰고 정상 그림은 그대로 남아야 한다.
+    #[test]
+    fn undecodable_png_and_gif_are_skipped_not_fatal() {
+        use base64::Engine as _;
+        // 2x1 RGB PNG 와 1x1 GIF.
+        const PNG_2X1: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGP4z8DAwPAfAAcAAf9+CLHQAAAAAElFTkSuQmCC";
+        const GIF_1X1: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let png = b64.decode(PNG_2X1).unwrap();
+        let gif = b64.decode(GIF_1X1).unwrap();
+
+        let page = |pictures: &[(&str, &[u8])]| {
+            let images: String = pictures
+                .iter()
+                .enumerate()
+                .map(|(i, (mime, bytes))| {
+                    format!(
+                        r#"<image href="data:{mime};base64,{}" x="{}" y="10" width="20" height="20"/>"#,
+                        b64.encode(bytes),
+                        10 + i * 30
+                    )
+                })
+                .collect();
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">{images}</svg>"#
+            )
+        };
+        let image_xobjects = |pdf: &[u8]| {
+            String::from_utf8_lossy(pdf)
+                .matches("/Subtype /Image")
+                .count()
+        };
+
+        let valid = [("image/png", &png[..]), ("image/gif", &gif[..])];
+        let valid_pdf = svg_to_pdf(&page(&valid)).expect("정상 그림은 변환돼야 한다");
+        let valid_count = image_xobjects(&valid_pdf);
+        assert!(
+            valid_count >= 2,
+            "정상 PNG·GIF 가 이미지 XObject 로 남아야 한다"
+        );
+
+        // 머리말은 온전하고 본문이 잘린 PNG(40바이트)·GIF(30바이트)를 정상 그림 사이에 끼운다.
+        let truncated_png = ("image/png", &png[..40]);
+        let truncated_gif = ("image/gif", &gif[..30]);
+        let mixed = [valid[0], truncated_png, truncated_gif, valid[1]];
+        let pdf =
+            svg_to_pdf(&page(&mixed)).expect("해독 못 한 그림은 건너뛰고 문서는 변환돼야 한다");
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert_eq!(
+            image_xobjects(&pdf),
+            valid_count,
+            "깨진 그림은 빠지고 정상 그림 둘만 남아야 한다"
+        );
+    }
+
     #[cfg(feature = "native-skia")]
     fn direct_pdf_test_tree(
         width: f64,

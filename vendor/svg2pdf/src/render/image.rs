@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use crate::ConversionError::InvalidImage;
 use image::{ColorType, DynamicImage, ImageFormat, Luma, Rgb, Rgba};
 use miniz_oxide::deflate::{compress_to_vec_zlib, CompressionLevel};
 use pdf_writer::{Chunk, Content, Filter, Finish};
@@ -26,8 +25,16 @@ pub fn render(
         return Ok(());
     }
 
+    // rhwp: a picture that cannot be decoded (truncated/corrupt PNG, GIF, JPEG, or a format this
+    // build lacks such as WebP) is skipped with a warning instead of failing the whole document
+    // with `InvalidImage`. Decoding is the first step of every arm below, so nothing has been
+    // written to `chunk`/`content`/`rc` yet when we bail out.
     let load_with_format = |content, format| {
-        image::load_from_memory_with_format(content, format).map_err(|_| InvalidImage)
+        image::load_from_memory_with_format(content, format)
+            .inspect_err(|e| {
+                eprintln!("경고: PDF 변환 중 그림({format:?})을 해독하지 못해 건너뜁니다: {e}")
+            })
+            .ok()
     };
 
     // Will return the name of the image (in the Resources dictionary) and the dimensions of the
@@ -36,19 +43,27 @@ pub fn render(
     let (image_name, image_size) = match kind {
         ImageKind::JPEG(content) => {
             // JPEGs don't support alphas, so no extra processing is required.
-            let image = load_with_format(content, ImageFormat::Jpeg)?;
+            let Some(image) = load_with_format(content, ImageFormat::Jpeg) else {
+                return Ok(());
+            };
             create_raster_image(chunk, ctx, content, Filter::DctDecode, &image, None, rc)
         }
         ImageKind::PNG(content) => {
-            let image = load_with_format(content, ImageFormat::Png)?;
+            let Some(image) = load_with_format(content, ImageFormat::Png) else {
+                return Ok(());
+            };
             create_transparent_image(chunk, ctx, &image, rc)
         }
         ImageKind::GIF(content) => {
-            let image = load_with_format(content, ImageFormat::Gif)?;
+            let Some(image) = load_with_format(content, ImageFormat::Gif) else {
+                return Ok(());
+            };
             create_transparent_image(chunk, ctx, &image, rc)
         }
         ImageKind::WEBP(content) => {
-            let image = load_with_format(content, ImageFormat::WebP)?;
+            let Some(image) = load_with_format(content, ImageFormat::WebP) else {
+                return Ok(());
+            };
             create_transparent_image(chunk, ctx, &image, rc)
         }
         // SVGs just get rendered recursively.
