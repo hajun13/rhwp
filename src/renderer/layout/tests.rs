@@ -2686,6 +2686,19 @@ where
 }
 
 fn render_tree_with_header_control(control: Control) -> PageRenderTree {
+    render_tree_with_header_paragraphs(
+        vec![Paragraph {
+            controls: vec![control],
+            ..Default::default()
+        }],
+        0,
+    )
+}
+
+fn render_tree_with_header_paragraphs(
+    header_paragraphs: Vec<Paragraph>,
+    declared_band_height: u32,
+) -> PageRenderTree {
     use crate::model::header_footer::Header;
     use crate::renderer::pagination::HeaderFooterRef;
 
@@ -2693,10 +2706,8 @@ fn render_tree_with_header_control(control: Control) -> PageRenderTree {
     let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
     let paragraphs = vec![Paragraph {
         controls: vec![Control::Header(Box::new(Header {
-            paragraphs: vec![Paragraph {
-                controls: vec![control],
-                ..Default::default()
-            }],
+            paragraphs: header_paragraphs,
+            text_height: declared_band_height,
             ..Default::default()
         }))],
         ..Default::default()
@@ -2762,6 +2773,161 @@ fn header_paper_relative_shape_uses_page_origin() {
     });
     assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
     assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+/// 머리말/꼬리말 문단에 떠 있는(글자처럼 취급하지 않는) 그림이나 도형이 같이 앵커돼 있으면
+/// 그림 분기가 그 문단의 글자를 쪽번호 필드만 남기고 버렸고, 같은 문단의 도형은 그리지
+/// 않았다. 로고 + 회색 띠 + 면책 문구를 한 문단에 둔 꼬리말이 통째로 빈 채로 나왔다.
+#[test]
+fn header_paragraph_with_floating_objects_keeps_its_text() {
+    fn text_runs(node: &RenderNode, out: &mut Vec<String>) {
+        if let RenderNodeType::TextRun(run) = &node.node_type {
+            out.push(run.text.clone());
+        }
+        node.children.iter().for_each(|child| text_runs(child, out));
+    }
+    fn has_node(node: &RenderNode, predicate: &dyn Fn(&RenderNodeType) -> bool) -> bool {
+        predicate(&node.node_type) || node.children.iter().any(|child| has_node(child, predicate))
+    }
+    let line = || LineSeg {
+        line_height: 400,
+        baseline_distance: 320,
+        ..Default::default()
+    };
+    let floating = CommonObjAttr {
+        width: 6_890,
+        height: 6_890,
+        horizontal_offset: 42_900,
+        vertical_offset: 420,
+        horz_rel_to: HorzRelTo::Column,
+        vert_rel_to: VertRelTo::Para,
+        text_wrap: TextWrap::Square,
+        ..Default::default()
+    };
+    let band = CommonObjAttr {
+        width: 64_004,
+        height: 11_670,
+        horz_rel_to: HorzRelTo::Paper,
+        vert_rel_to: VertRelTo::Para,
+        text_wrap: TextWrap::BehindText,
+        ..Default::default()
+    };
+    // 선언한 밴드 높이(7965HU)가 머리말 area(4252HU)보다 크다 — 그림 높이(6890HU)를 흐름에 더해도
+    // 다음 문단이 끊기지 않아야 한다.
+    let tree = render_tree_with_header_paragraphs(
+        vec![
+            Paragraph {
+                text: "Copyright first".to_string(),
+                line_segs: vec![line()],
+                controls: vec![
+                    Control::Picture(Box::new(crate::model::image::Picture {
+                        common: floating,
+                        ..Default::default()
+                    })),
+                    Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+                        common: band,
+                        ..Default::default()
+                    }))),
+                ],
+                ..Default::default()
+            },
+            Paragraph {
+                text: "second paragraph".to_string(),
+                line_segs: vec![line()],
+                ..Default::default()
+            },
+        ],
+        7_965,
+    );
+
+    let header = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::Header))
+        .expect("header node should be rendered");
+    let mut texts = Vec::new();
+    text_runs(header, &mut texts);
+    let joined = texts.join("|");
+    assert!(
+        joined.contains("Copyright first"),
+        "own text lost: {joined:?}"
+    );
+    assert!(
+        joined.contains("second paragraph"),
+        "next paragraph lost: {joined:?}"
+    );
+    assert!(
+        has_node(header, &|node_type| matches!(
+            node_type,
+            RenderNodeType::Rectangle(_)
+        )),
+        "the shape anchored in the same paragraph is not drawn"
+    );
+}
+
+/// 위아래 자리를 차지하는(TopAndBottom) 그림과 같은 문단의 글자는 그림 위에 겹치지 않고 그림 아래에서
+/// 시작한다. 쪽번호 필드가 아닌 일반 글자가 그림 분기에서 버려지던 것을 고치면서 그리는 위치를 함께 정한다.
+#[test]
+fn header_text_starts_below_top_and_bottom_picture() {
+    fn first_bbox(
+        node: &RenderNode,
+        predicate: &dyn Fn(&RenderNodeType) -> bool,
+    ) -> Option<BoundingBox> {
+        if predicate(&node.node_type) {
+            return Some(node.bbox);
+        }
+        node.children
+            .iter()
+            .find_map(|child| first_bbox(child, predicate))
+    }
+    let tree = render_tree_with_header_paragraphs(
+        vec![Paragraph {
+            text: "beside the logo".to_string(),
+            line_segs: vec![LineSeg {
+                line_height: 400,
+                baseline_distance: 320,
+                ..Default::default()
+            }],
+            controls: vec![Control::Picture(Box::new(crate::model::image::Picture {
+                common: CommonObjAttr {
+                    width: 6_890,
+                    height: 2_450,
+                    horz_rel_to: HorzRelTo::Column,
+                    vert_rel_to: VertRelTo::Para,
+                    text_wrap: TextWrap::TopAndBottom,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))],
+            ..Default::default()
+        }],
+        0,
+    );
+    let header = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::Header))
+        .expect("header node should be rendered");
+    let picture = first_bbox(header, &|node_type| {
+        matches!(
+            node_type,
+            RenderNodeType::Image(_) | RenderNodeType::Placeholder(_)
+        )
+    })
+    .expect("picture should be rendered");
+    let text = first_bbox(header, &|node_type| {
+        matches!(node_type, RenderNodeType::TextRun(_))
+    })
+    .expect("text should be rendered");
+    assert!(
+        text.y + 0.5 >= picture.y + picture.height,
+        "text (y {:.1}) overlaps the picture (y {:.1}..{:.1})",
+        text.y,
+        picture.y,
+        picture.y + picture.height
+    );
 }
 
 /// [#6608] 머리말 안 용지 기준 그림은 물리 용지가 아니라 **머리말 틀 원점**에서

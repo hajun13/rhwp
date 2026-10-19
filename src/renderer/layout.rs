@@ -4949,6 +4949,42 @@ impl LayoutEngine {
                     // 그림의 y 누적은 다음 그림 배치용이므로, 인라인 필드는 원래
                     // 문단 기준선(text_y)에서 따로 레이아웃한다.
                     let text_y = y_offset;
+                    // 같은 문단의 도형(글상자·배경 사각형)은 그림 분기가 `has_shape` 분기를 가려
+                    // 그려지지 않았다. 그림·도형을 함께 앵커한 꼬리말(로고 + 회색 띠 + 면책 문구)이
+                    // 통째로 비었다 — 도형은 문단 맨 위 기준으로 그린다. 글 뒤로(BehindText)
+                    // 도형은 그림보다 먼저 깔아야 띠가 로고를 덮지 않는다(아래 호출 두 곳).
+                    let layout_para_shapes =
+                        |this: &Self,
+                         tree: &mut PageLayoutContext,
+                         area_node: &mut RenderNode,
+                         behind: bool| {
+                            for (ci, ctrl) in para.controls.iter().enumerate() {
+                                if let Control::Shape(shape) = ctrl {
+                                    let is_behind =
+                                        matches!(shape.common().text_wrap, TextWrap::BehindText);
+                                    if is_behind == behind {
+                                        this.layout_shape(
+                                            tree,
+                                            area_node,
+                                            hf_paragraphs,
+                                            i,
+                                            ci,
+                                            0,
+                                            styles,
+                                            area,
+                                            body_area,
+                                            paper_area,
+                                            text_y,
+                                            Alignment::Left,
+                                            bin_data_content,
+                                            &std::collections::HashMap::new(),
+                                            is_header,
+                                        );
+                                    }
+                                }
+                            }
+                        };
+                    layout_para_shapes(self, tree, area_node, true);
                     // 머리말/꼬리말 내 Picture: header/footer area 기준 배치
                     for (ci, ctrl) in para.controls.iter().enumerate() {
                         if let Control::Picture(pic) = ctrl {
@@ -5023,7 +5059,24 @@ impl LayoutEngine {
                                 )
                         )
                     });
-                    if has_page_auto_number {
+                    layout_para_shapes(self, tree, area_node, false);
+                    // 떠 있는 그림 곁의 글자도 그린다. 쪽번호 필드(#7333)만 그리던 조건이
+                    // 일반 글자를 버려, 그림과 같은 문단에 놓인 꼬리말 문구가 사라졌다.
+                    // 쪽번호·총쪽수·파일이름 필드 표지(U+0015~0017)도 글자로 센다.
+                    let has_text = para.text.chars().any(|ch| {
+                        !ch.is_whitespace()
+                            && (!ch.is_control() || matches!(ch, '\u{0015}'..='\u{0017}'))
+                    });
+                    // 쪽번호 필드는 종전대로 문단 기준선(text_y)에서 그린다(#7333). 일반 글자는 위아래
+                    // 자리를 차지하는(TopAndBottom) 그림이 같은 문단에 있으면 그림 아래에서 시작한다 —
+                    // 그림 위에 겹쳐 그리지 않는다.
+                    let below_pictures = !has_page_auto_number
+                        && para.controls.iter().any(|ctrl| {
+                            matches!(ctrl, Control::Picture(pic)
+                                if !pic.common.treat_as_char
+                                    && matches!(pic.common.text_wrap, TextWrap::TopAndBottom))
+                        });
+                    if has_page_auto_number || has_text {
                         let text_end = self.layout_paragraph(
                             tree,
                             area_node,
@@ -5031,7 +5084,7 @@ impl LayoutEngine {
                             Some(&comp),
                             styles,
                             area,
-                            text_y,
+                            if below_pictures { y_offset } else { text_y },
                             0,
                             usize::MAX - i,
                             None,
@@ -5144,7 +5197,15 @@ impl LayoutEngine {
                     None, // 머리말/꼬리말 컨텍스트 — wrap zone 무관
                 );
             }
-            if y_offset >= area.y + area.height {
+            // HWPX subList 가 선언한 밴드 높이(`textHeight`)가 area 보다 크면 그 높이까지를 영역으로
+            // 본다. HWPX 의 area 높이는 아래 여백(`bottom`)만큼만 잡혀, 꼬리말이 큰 문서(Word 변환본:
+            // bottom 1035HU·footer 7965HU)는 떠 있는 그림 높이만 더해도 첫 문단 뒤에 루프가 끊겨
+            // 다음 문단이 통째로 사라졌다. 선언값이 0 이면 종전과 같다(HWP5 도 LIST_HEADER 에 같은 값을 싣는다).
+            let area_bottom = area.y
+                + area
+                    .height
+                    .max(hwpunit_to_px(band_height_hu as i32, self.dpi));
+            if y_offset >= area_bottom {
                 break;
             }
         }
