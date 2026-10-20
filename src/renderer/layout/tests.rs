@@ -2934,11 +2934,17 @@ fn render_tree_with_footer_paragraphs(
     footer_paragraphs: Vec<Paragraph>,
     declared_band_height: u32,
     list_attr: u32,
+    hwpx: bool,
 ) -> PageRenderTree {
     use crate::model::header_footer::Footer;
     use crate::renderer::pagination::HeaderFooterRef;
 
     let engine = LayoutEngine::with_default_dpi();
+    if hwpx {
+        engine.set_layout_profile(crate::model::provenance::LayoutCompatibilityProfile::new(
+            false, false, true, true, false, false,
+        ));
+    }
     let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
     let paragraphs = vec![Paragraph {
         controls: vec![Control::Footer(Box::new(Footer {
@@ -3045,6 +3051,7 @@ fn footer_paragraph_with_inline_picture_still_draws_its_floating_objects() {
         }],
         0,
         0,
+        false,
     );
 
     let mut nodes = Vec::new();
@@ -3147,7 +3154,7 @@ fn bottom_aligned_footer_text_ignores_floating_objects() {
     const BAND_HU: u32 = 0;
     const BOTTOM: u32 = 2 << 21;
     let tops_of = |controls: Vec<Control>| {
-        let tree = render_tree_with_footer_paragraphs(paragraphs(controls), BAND_HU, BOTTOM);
+        let tree = render_tree_with_footer_paragraphs(paragraphs(controls), BAND_HU, BOTTOM, true);
         let mut tops = Vec::new();
         text_tops(footer_node(&tree), &mut tops);
         tops
@@ -3179,6 +3186,52 @@ fn bottom_aligned_footer_text_ignores_floating_objects() {
             "text moved by the floating objects: {with_objects:?} vs {plain:?}"
         );
     }
+}
+
+/// HWP 원본 꼬리말은 한글이 저장한 줄 위치(vpos)에 문단을 놓는다. 글 없이 떠 있는 로고만 든 문단이
+/// 로고 높이만큼 자리를 차지하면 아래 문구가 한글보다 내려간다(250904 계약서, 약 20pt).
+#[test]
+fn hwp5_footer_paragraphs_keep_their_stored_positions() {
+    fn text_tops(node: &RenderNode, out: &mut Vec<f64>) {
+        if matches!(node.node_type, RenderNodeType::TextRun(_)) {
+            out.push(node.bbox.y);
+        }
+        node.children.iter().for_each(|child| text_tops(child, out));
+    }
+    let logo = Control::Picture(Box::new(Picture {
+        common: CommonObjAttr {
+            width: 4_446,
+            height: 4_332,
+            vert_rel_to: VertRelTo::Para,
+            text_wrap: TextWrap::InFrontOfText,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let tops_of = |controls: Vec<Control>| {
+        let paragraphs = vec![
+            Paragraph {
+                line_segs: vec![LineSeg { line_height: 1000, line_spacing: -300, baseline_distance: 850, ..Default::default() }],
+                controls,
+                ..Default::default()
+            },
+            Paragraph {
+                text: "Copyright".to_string(),
+                line_segs: vec![LineSeg { vertical_pos: 700, line_height: 600, baseline_distance: 510, ..Default::default() }],
+                ..Default::default()
+            },
+        ];
+        // 위 맞춤으로 둔다 — 아래 맞춤의 2차 이동과 섞지 않고 문단 자리만 본다.
+        let tree = render_tree_with_footer_paragraphs(paragraphs, 0, 0, false);
+        let mut tops = Vec::new();
+        text_tops(footer_node(&tree), &mut tops);
+        tops
+    };
+    let plain = tops_of(Vec::new());
+    let with_logo = tops_of(vec![logo]);
+    // 마지막 글자 줄이 "Copyright" 다.
+    let (with, without) = (with_logo.last().unwrap(), plain.last().unwrap());
+    assert!((with - without).abs() < 0.5, "the logo pushed the text: {with_logo:?} vs {plain:?}");
 }
 
 /// 용지·쪽 기준으로 앵커한 떠 있는 개체(HWP5 꼬리말의 로고)는 틀 원점에 붙어 있어, 아래 맞춤에서
@@ -3219,6 +3272,7 @@ fn bottom_aligned_footer_keeps_measuring_paper_anchored_objects() {
         }],
         0,
         2 << 21,
+        false,
     );
     let mut tops = Vec::new();
     text_tops(footer_node(&tree), &mut tops);

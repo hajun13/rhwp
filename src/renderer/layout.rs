@@ -4876,7 +4876,21 @@ impl LayoutEngine {
                 _ => 0.0,
             }
             + stored_mixed_footer_leading;
+        // HWP 원본 꼬리말은 한글이 저장한 줄 위치(vpos)를 그대로 쓴다. 다시 재면 글이 없는
+        // 문단(회색 띠, 떠 있는 로고)이 한글과 다른 높이를 차지해 문구가 위아래로 어긋났다
+        // (250904 계약서: 로고 높이를 더해 27px 아래). vpos 가 0에서 시작해 문단마다 늘 때만 믿는다.
+        let stored_grid = !is_header
+            && !self.profile.get().hwpx_container()
+            && hf_paragraphs.first().is_some_and(|p| p.line_segs.first().is_some_and(|s| s.vertical_pos == 0))
+            && hf_paragraphs.iter().all(|p| !p.line_segs.is_empty())
+            && hf_paragraphs
+                .windows(2)
+                .all(|w| w[1].line_segs[0].vertical_pos > w[0].line_segs[0].vertical_pos);
+        let grid_origin = y_offset;
         for (i, para) in hf_paragraphs.iter().enumerate() {
+            if stored_grid {
+                y_offset = grid_origin + hwpunit_to_px(para.line_segs[0].vertical_pos, self.dpi);
+            }
             // 테이블 컨트롤이 있으면 테이블 렌더링
             let has_table = para.controls.iter().any(|c| matches!(c, Control::Table(_)));
             let has_shape = para.controls.iter().any(|c| matches!(c, Control::Shape(_)));
@@ -5310,7 +5324,9 @@ impl LayoutEngine {
                 + area
                     .height
                     .max(hwpunit_to_px(band_height_hu as i32, self.dpi));
-            if y_offset >= area_bottom {
+            // 저장 위치를 쓰는 HWP 꼬리말은 다음 문단의 자리가 vpos 로 정해져 있어, 떠 있는 그림 높이로
+            // 불어난 y_offset 으로 끊지 않는다.
+            if y_offset >= area_bottom && !stored_grid {
                 break;
             }
         }
@@ -6626,7 +6642,10 @@ impl LayoutEngine {
                     .map(|c| c.bbox.y + c.bbox.height)
                     .fold(f64::MIN, f64::max)
             };
-            let content_bottom = match flow_bottom(true) {
+            // 떠 있는 개체를 빼는 것은 Word의 꼬리말 규칙이다(HWPX는 우리 변환기가 Word 문서로 만든다).
+            // 한글은 HWP 원본에서 띠까지 내용 높이에 넣어, 띠가 밴드 아래로 뻗으면 글을 위쪽에 둔다.
+            let skip_floating = self.profile.get().hwpx_container();
+            let content_bottom = match flow_bottom(skip_floating) {
                 bottom if bottom > f64::MIN => bottom,
                 _ => flow_bottom(false),
             };
