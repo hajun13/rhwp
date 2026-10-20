@@ -2930,6 +2930,310 @@ fn header_text_starts_below_top_and_bottom_picture() {
     );
 }
 
+fn render_tree_with_footer_paragraphs(
+    footer_paragraphs: Vec<Paragraph>,
+    declared_band_height: u32,
+    list_attr: u32,
+) -> PageRenderTree {
+    use crate::model::header_footer::Footer;
+    use crate::renderer::pagination::HeaderFooterRef;
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let paragraphs = vec![Paragraph {
+        controls: vec![Control::Footer(Box::new(Footer {
+            paragraphs: footer_paragraphs,
+            text_height: declared_band_height,
+            list_attr,
+            ..Default::default()
+        }))],
+        ..Default::default()
+    }];
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 1,
+        page_number_restarted: false,
+        section_index: 0,
+        layout,
+        column_contents: Vec::new(),
+        active_header: None,
+        active_footer: Some(HeaderFooterRef {
+            para_index: 0,
+            control_index: 0,
+            source_section_index: 0,
+            table_path: Vec::new(),
+        }),
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
+    };
+    engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &[],
+        &ResolvedStyleSet::default(),
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    )
+}
+
+fn footer_node(tree: &PageRenderTree) -> &RenderNode {
+    tree.root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::Footer))
+        .expect("footer node should be rendered")
+}
+
+/// 같은 꼬리말 문단에 글자처럼 취급하는 그림이 하나라도 있으면 그림 분기의 `else`가 문단(글자와
+/// 인라인 그림)만 그리고 떠 있는 도형·그림을 버렸다. 에너지엑스 양식 꼬리말(글 뒤 회색 띠 + 오른쪽
+/// 떠 있는 로고 + 가운데 인라인 로고 + 문구)에서 띠와 오른쪽 로고가 통째로 사라졌다.
+#[test]
+fn footer_paragraph_with_inline_picture_still_draws_its_floating_objects() {
+    fn flatten<'a>(node: &'a RenderNode, out: &mut Vec<&'a RenderNodeType>) {
+        out.push(&node.node_type);
+        node.children.iter().for_each(|child| flatten(child, out));
+    }
+    let object_common = |width, height, horizontal_offset, wrap| CommonObjAttr {
+        width,
+        height,
+        horizontal_offset,
+        horz_rel_to: HorzRelTo::Column,
+        vert_rel_to: VertRelTo::Para,
+        text_wrap: wrap,
+        ..Default::default()
+    };
+    let picture = |common| {
+        Control::Picture(Box::new(Picture {
+            common,
+            ..Default::default()
+        }))
+    };
+    let logo = picture(object_common(4_196, 4_129, 45_144, TextWrap::InFrontOfText));
+    let band = Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+        common: CommonObjAttr {
+            horz_rel_to: HorzRelTo::Paper,
+            ..object_common(64_000, 12_835, 0, TextWrap::BehindText)
+        },
+        ..Default::default()
+    })));
+    let inline = picture(CommonObjAttr {
+        treat_as_char: true,
+        ..object_common(4_640, 4_595, 0, TextWrap::TopAndBottom)
+    });
+    let tree = render_tree_with_footer_paragraphs(
+        vec![Paragraph {
+            text: "Copyright".to_string(),
+            line_segs: vec![LineSeg {
+                line_height: 400,
+                baseline_distance: 320,
+                segment_width: 45_135,
+                ..Default::default()
+            }],
+            controls: vec![logo, band, inline],
+            ..Default::default()
+        }],
+        0,
+        0,
+    );
+
+    let mut nodes = Vec::new();
+    flatten(footer_node(&tree), &mut nodes);
+    let band_at = nodes
+        .iter()
+        .position(|node| matches!(node, RenderNodeType::Rectangle(_)))
+        .expect("the grey band anchored in the same paragraph is not drawn");
+    let pictures: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node,
+                RenderNodeType::Image(_) | RenderNodeType::Placeholder(_)
+            )
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        pictures.len(),
+        2,
+        "the inline logo and the floating logo should both be drawn"
+    );
+    assert!(
+        band_at < pictures[0],
+        "a behind-text band must be laid down before the pictures"
+    );
+    // 글자처럼 취급하는 그림이 글 사이에 끼면 글이 두 런으로 나뉘므로 이어 붙여 찾는다.
+    let text: String = nodes
+        .iter()
+        .filter_map(|node| match node {
+            RenderNodeType::TextRun(run) => Some(run.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("Copyright"),
+        "the paragraph's own text is lost: {text:?}"
+    );
+}
+
+/// `vertAlign=BOTTOM` 꼬리말의 아래 맞춤은 글이 차지한 높이로 한다. 글 뒤·글 앞으로 떠 있는 개체(밴드
+/// 아래로 길게 뻗은 회색 띠, 로고)가 내용 높이에 들어가면 여유가 없다고 보고 글이 밴드 위쪽에 붙어,
+/// 개체가 없는 같은 꼬리말과 글 위치가 달랐다(에너지엑스 양식에서 첫 줄이 35pt 위). 개체가 있어도
+/// 없어도 글은 같은 줄에 놓이고, 떠 있는 그림의 높이가 다음 문단을 밀어내지 않는다.
+#[test]
+fn bottom_aligned_footer_text_ignores_floating_objects() {
+    fn text_tops(node: &RenderNode, out: &mut Vec<f64>) {
+        if matches!(node.node_type, RenderNodeType::TextRun(_)) {
+            out.push(node.bbox.y);
+        }
+        node.children.iter().for_each(|child| text_tops(child, out));
+    }
+    let line = || LineSeg {
+        line_height: 400,
+        baseline_distance: 320,
+        ..Default::default()
+    };
+    let paragraphs = |controls: Vec<Control>| {
+        vec![
+            Paragraph {
+                text: "first line".to_string(),
+                line_segs: vec![line()],
+                controls,
+                ..Default::default()
+            },
+            Paragraph {
+                text: "second line".to_string(),
+                line_segs: vec![line()],
+                ..Default::default()
+            },
+        ]
+    };
+    let band = Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+        common: CommonObjAttr {
+            width: 64_000,
+            height: 12_835,
+            horz_rel_to: HorzRelTo::Paper,
+            vert_rel_to: VertRelTo::Para,
+            text_wrap: TextWrap::BehindText,
+            ..Default::default()
+        },
+        ..Default::default()
+    })));
+    let logo = Control::Picture(Box::new(Picture {
+        common: CommonObjAttr {
+            width: 4_196,
+            height: 4_129,
+            horizontal_offset: 45_144,
+            horz_rel_to: HorzRelTo::Column,
+            vert_rel_to: VertRelTo::Para,
+            text_wrap: TextWrap::InFrontOfText,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    // 선언한 밴드 높이 0 — 1차 정렬(줄 높이 합 추정)을 끄고 실제로 그려진 글의 높이로 하는
+    // 아래 맞춤만 비교한다. Word 변환본은 밴드가 area 보다 커서 실제로도 이 경로를 탄다.
+    const BAND_HU: u32 = 0;
+    const BOTTOM: u32 = 2 << 21;
+    let tops_of = |controls: Vec<Control>| {
+        let tree = render_tree_with_footer_paragraphs(paragraphs(controls), BAND_HU, BOTTOM);
+        let mut tops = Vec::new();
+        text_tops(footer_node(&tree), &mut tops);
+        tops
+    };
+    let plain = tops_of(Vec::new());
+    let with_objects = tops_of(vec![band, logo]);
+
+    assert_eq!(
+        plain.len(),
+        2,
+        "both text paragraphs should be drawn: {plain:?}"
+    );
+    assert!(
+        plain[0]
+            > PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default())
+                .footer_area
+                .y
+                + 1.0,
+        "the plain footer should be bottom aligned, not glued to the top: {plain:?}"
+    );
+    assert_eq!(
+        with_objects.len(),
+        2,
+        "both text paragraphs should be drawn next to the objects: {with_objects:?}"
+    );
+    for (with, without) in with_objects.iter().zip(&plain) {
+        assert!(
+            (with - without).abs() < 0.5,
+            "text moved by the floating objects: {with_objects:?} vs {plain:?}"
+        );
+    }
+}
+
+/// 용지·쪽 기준으로 앵커한 떠 있는 개체(HWP5 꼬리말의 로고)는 틀 원점에 붙어 있어, 아래 맞춤에서
+/// 글과 함께 밀리면 쪽 밖으로 잘린다. 아래 맞춤의 내용 높이에서는 **문단에 앵커한** 개체만 빼고
+/// 용지 기준 개체는 종전대로 잰다 — 쪽 아래로 뻗은 로고가 있으면 글은 밀리지 않는다.
+#[test]
+fn bottom_aligned_footer_keeps_measuring_paper_anchored_objects() {
+    fn text_tops(node: &RenderNode, out: &mut Vec<f64>) {
+        if matches!(node.node_type, RenderNodeType::TextRun(_)) {
+            out.push(node.bbox.y);
+        }
+        node.children.iter().for_each(|child| text_tops(child, out));
+    }
+    let logo = Control::Picture(Box::new(Picture {
+        common: CommonObjAttr {
+            width: 4_196,
+            height: 4_129,
+            horizontal_offset: 45_144,
+            // 쪽 높이(84188HU) 아래로 뻗는 위치
+            vertical_offset: 83_000,
+            horz_rel_to: HorzRelTo::Paper,
+            vert_rel_to: VertRelTo::Paper,
+            text_wrap: TextWrap::InFrontOfText,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let tree = render_tree_with_footer_paragraphs(
+        vec![Paragraph {
+            text: "footer line".to_string(),
+            line_segs: vec![LineSeg {
+                line_height: 400,
+                baseline_distance: 320,
+                ..Default::default()
+            }],
+            controls: vec![logo],
+            ..Default::default()
+        }],
+        0,
+        2 << 21,
+    );
+    let mut tops = Vec::new();
+    text_tops(footer_node(&tree), &mut tops);
+    let footer_top = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default())
+        .footer_area
+        .y;
+    assert_eq!(tops.len(), 1, "the footer text should be drawn: {tops:?}");
+    assert!(
+        (tops[0] - footer_top).abs() < 0.5,
+        "text moved to {:.1} although the paper-anchored logo hangs below the page (footer top {:.1})",
+        tops[0],
+        footer_top
+    );
+}
+
 /// [#6608] 머리말 안 용지 기준 그림은 물리 용지가 아니라 **머리말 틀 원점**에서
 /// 오프셋을 잰다. PR #1682 는 바탕쪽의 용지 원점 규칙을 머리말에도 유추해
 /// 이 테스트를 용지 원점으로 적었지만, 실문서 `pic-in-head-02.hwp` 를 한/글 2020·2022

@@ -4781,6 +4781,12 @@ impl LayoutEngine {
     /// 머리말/꼬리말 문단을 해당 영역에 레이아웃한다.
     /// [Task #825] `outer_section_index` + `outer_hf_ref` — 머리말/꼬리말 그림 클릭
     /// hit-test marker (Some 일 때 ImageNode 에 전파). None 이면 기존 동작 (그림 미선택).
+    ///
+    /// 돌려주는 값은 흐름에서 자리를 차지하지 않고 **문단에 앵커한**(`vertRelTo=PARA`) 글 뒤·글 앞
+    /// 도형·그림 노드의 id다. 꼬리말 아래 맞춤은 글이 차지한 높이로 하므로(`build_footer`) 이 노드는
+    /// 뺀다 — 글 뒤 회색 띠가 내용 높이에 들어가 글이 밴드 위쪽에 붙는 것을 막는다. 문단과 함께
+    /// 움직이는 개체만 뺀다: 용지·쪽 기준 개체는 틀 원점에 붙어 있어 아래 맞춤 이동량이 커지면
+    /// 글과 함께 쪽 밖으로 밀리므로 종전대로 잰다.
     #[allow(clippy::too_many_arguments)]
     fn layout_header_footer_paragraphs(
         &self,
@@ -4801,7 +4807,8 @@ impl LayoutEngine {
         is_header: bool,
         list_attr: u32,
         band_height_hu: u32,
-    ) {
+    ) -> Vec<NodeId> {
+        let mut floating_ids: Vec<NodeId> = Vec::new();
         // [#6186] 머리말/꼬리말 subList 의 `vertAlign`(HWPX) = LIST_HEADER list_attr
         // 비트 21~22 (0=TOP, 1=CENTER, 2=BOTTOM). 파서는 이미 값을 싣는데
         // 레이아웃이 읽지 않아 늘 밴드 맨 위에 놓였다 — 156755659 는 BOTTOM 이라
@@ -4942,49 +4949,134 @@ impl LayoutEngine {
             } else if has_picture {
                 // Picture 컨트롤이 있는 문단
                 let comp = self.compose_header_footer_paragraph(para, page_number, styles);
-                if comp.tac_controls.is_empty() {
-                    // 글자처럼 취급하지 않는 그림과 쪽번호 AutoNumber가 같은 꼬리말
-                    // 문단에 공존할 수 있다. 그림만 개별 배치하고 끝내면 AutoNumber가
-                    // 조합 텍스트에 남아 있어도 전혀 그려지지 않는다(#7333).
-                    // 그림의 y 누적은 다음 그림 배치용이므로, 인라인 필드는 원래
-                    // 문단 기준선(text_y)에서 따로 레이아웃한다.
-                    let text_y = y_offset;
-                    // 같은 문단의 도형(글상자·배경 사각형)은 그림 분기가 `has_shape` 분기를 가려
-                    // 그려지지 않았다. 그림·도형을 함께 앵커한 꼬리말(로고 + 회색 띠 + 면책 문구)이
-                    // 통째로 비었다 — 도형은 문단 맨 위 기준으로 그린다. 글 뒤로(BehindText)
-                    // 도형은 그림보다 먼저 깔아야 띠가 로고를 덮지 않는다(아래 호출 두 곳).
-                    let layout_para_shapes =
-                        |this: &Self,
-                         tree: &mut PageLayoutContext,
-                         area_node: &mut RenderNode,
-                         behind: bool| {
-                            for (ci, ctrl) in para.controls.iter().enumerate() {
-                                if let Control::Shape(shape) = ctrl {
-                                    let is_behind =
-                                        matches!(shape.common().text_wrap, TextWrap::BehindText);
-                                    if is_behind == behind {
-                                        this.layout_shape(
-                                            tree,
-                                            area_node,
-                                            hf_paragraphs,
-                                            i,
-                                            ci,
-                                            0,
-                                            styles,
-                                            area,
-                                            body_area,
-                                            paper_area,
-                                            text_y,
-                                            Alignment::Left,
-                                            bin_data_content,
-                                            &std::collections::HashMap::new(),
-                                            is_header,
+                // 그림의 y 누적은 다음 그림 배치용이므로, 인라인 필드는 원래
+                // 문단 기준선(text_y)에서 따로 레이아웃한다.
+                let text_y = y_offset;
+                // 같은 문단의 도형(글상자·배경 사각형)은 그림 분기가 `has_shape` 분기를 가려
+                // 그려지지 않았다. 그림·도형을 함께 앵커한 꼬리말(로고 + 회색 띠 + 면책 문구)이
+                // 통째로 비었다 — 도형은 문단 맨 위 기준으로 그린다. 글 뒤로(BehindText)
+                // 도형은 그림보다 먼저 깔아야 띠가 로고를 덮지 않는다(아래 호출 두 곳).
+                // 글자처럼 취급하는 개체가 든 문단(`tac_controls`)의 글자처럼 취급하는 도형은 종전대로
+                // 이 경로에서 그리지 않는다(`layout_paragraph`가 좌표만 등록한다) — 떠 있는 도형만 그린다.
+                let has_inline_controls = !comp.tac_controls.is_empty();
+                let layout_para_shapes =
+                    |this: &Self,
+                     tree: &mut PageLayoutContext,
+                     area_node: &mut RenderNode,
+                     behind: bool,
+                     floating: &mut Vec<NodeId>| {
+                        for (ci, ctrl) in para.controls.iter().enumerate() {
+                            if let Control::Shape(shape) = ctrl {
+                                if has_inline_controls && shape.common().treat_as_char {
+                                    continue;
+                                }
+                                let is_behind =
+                                    matches!(shape.common().text_wrap, TextWrap::BehindText);
+                                if is_behind == behind {
+                                    let drawn_from = area_node.children.len();
+                                    this.layout_shape(
+                                        tree,
+                                        area_node,
+                                        hf_paragraphs,
+                                        i,
+                                        ci,
+                                        0,
+                                        styles,
+                                        area,
+                                        body_area,
+                                        paper_area,
+                                        text_y,
+                                        Alignment::Left,
+                                        bin_data_content,
+                                        &std::collections::HashMap::new(),
+                                        is_header,
+                                    );
+                                    if !shape.common().treat_as_char
+                                        && matches!(shape.common().vert_rel_to, VertRelTo::Para)
+                                        && matches!(
+                                            shape.common().text_wrap,
+                                            TextWrap::BehindText | TextWrap::InFrontOfText
+                                        )
+                                    {
+                                        floating.extend(
+                                            area_node.children[drawn_from..].iter().map(|n| n.id),
                                         );
                                     }
                                 }
                             }
+                        }
+                    };
+                // 글자처럼 취급하지 않는(떠 있는) 그림을 header/footer area 기준으로 배치한다.
+                // `Paper`/`Page` 기준은 header/footer 틀을 원점으로
+                // 다시 해석하므로 para_y의 저장 grid 선행을 읽지 않는다.
+                // 완전한 BOTTOM HWP5 grid로 확인한 경우에만 그 틀 원점도
+                // 첫 줄 leading만큼 이동한다. `Para`/`Column` 그림은 이미
+                // y_offset을 쓰므로 여기서 area를 움직이면 두 번 더해진다.
+                let layout_floating_picture =
+                    |this: &Self,
+                     tree: &mut PageLayoutContext,
+                     area_node: &mut RenderNode,
+                     pic: &crate::model::image::Picture,
+                     ci: usize,
+                     para_y: f64,
+                     floating: &mut Vec<NodeId>| {
+                        let drawn_from = area_node.children.len();
+                        let picture_area = if !is_header
+                            && stored_mixed_footer_leading > 0.0
+                            && matches!(pic.common.vert_rel_to, VertRelTo::Paper | VertRelTo::Page)
+                        {
+                            LayoutRect {
+                                y: area.y + stored_mixed_footer_leading,
+                                ..*area
+                            }
+                        } else {
+                            *area
                         };
-                    layout_para_shapes(self, tree, area_node, true);
+                        this.layout_header_footer_picture(
+                            tree,
+                            area_node,
+                            pic,
+                            &picture_area,
+                            para_y,
+                            bin_data_content,
+                            outer_section_index,
+                            i,
+                            ci,
+                            outer_hf_ref.clone(),
+                            styles,
+                        );
+                        if matches!(pic.common.vert_rel_to, VertRelTo::Para)
+                            && matches!(
+                                pic.common.text_wrap,
+                                TextWrap::BehindText | TextWrap::InFrontOfText
+                            )
+                        {
+                            floating.extend(area_node.children[drawn_from..].iter().map(|n| n.id));
+                        }
+                    };
+                if comp.tac_controls.is_empty() {
+                    // 글자처럼 취급하지 않는 그림과 쪽번호 AutoNumber가 같은 꼬리말
+                    // 문단에 공존할 수 있다. 그림만 개별 배치하고 끝내면 AutoNumber가
+                    // 조합 텍스트에 남아 있어도 전혀 그려지지 않는다(#7333).
+                    layout_para_shapes(self, tree, area_node, true, &mut floating_ids);
+                    let has_page_auto_number = para.controls.iter().any(|ctrl| {
+                        matches!(
+                            ctrl,
+                            Control::AutoNumber(number)
+                                if matches!(
+                                    number.number_type,
+                                    crate::model::control::AutoNumberType::Page
+                                        | crate::model::control::AutoNumberType::TotalPage
+                                )
+                        )
+                    });
+                    // 떠 있는 그림 곁의 글자도 그린다. 쪽번호 필드(#7333)만 그리던 조건이
+                    // 일반 글자를 버려, 그림과 같은 문단에 놓인 꼬리말 문구가 사라졌다.
+                    // 쪽번호·총쪽수·파일이름 필드 표지(U+0015~0017)도 글자로 센다.
+                    let has_text = para.text.chars().any(|ch| {
+                        !ch.is_whitespace()
+                            && (!ch.is_control() || matches!(ch, '\u{0015}'..='\u{0017}'))
+                    });
                     // 머리말/꼬리말 내 Picture: header/footer area 기준 배치
                     for (ci, ctrl) in para.controls.iter().enumerate() {
                         if let Control::Picture(pic) = ctrl {
@@ -5012,61 +5104,34 @@ impl LayoutEngine {
                                     styles,
                                 );
                             } else {
-                                // `Paper`/`Page` 기준은 header/footer 틀을 원점으로
-                                // 다시 해석하므로 para_y의 저장 grid 선행을 읽지 않는다.
-                                // 완전한 BOTTOM HWP5 grid로 확인한 경우에만 그 틀 원점도
-                                // 첫 줄 leading만큼 이동한다. `Para`/`Column` 그림은 이미
-                                // y_offset을 쓰므로 여기서 area를 움직이면 두 번 더해진다.
-                                let picture_area = if !is_header
-                                    && stored_mixed_footer_leading > 0.0
-                                    && matches!(
-                                        pic.common.vert_rel_to,
-                                        VertRelTo::Paper | VertRelTo::Page
-                                    ) {
-                                    LayoutRect {
-                                        y: area.y + stored_mixed_footer_leading,
-                                        ..*area
-                                    }
-                                } else {
-                                    *area
-                                };
-                                self.layout_header_footer_picture(
+                                layout_floating_picture(
+                                    self,
                                     tree,
                                     area_node,
                                     pic,
-                                    &picture_area,
-                                    y_offset,
-                                    bin_data_content,
-                                    outer_section_index,
-                                    i,
                                     ci,
-                                    outer_hf_ref.clone(),
-                                    styles,
+                                    y_offset,
+                                    &mut floating_ids,
                                 );
                             }
-                            let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
-                            y_offset += pic_h;
+                            // 글 뒤·글 앞으로 떠 있는 그림은 흐름에서 자리를 차지하지 않는다 — 높이를
+                            // 더하면 뒤 문단이 그림 높이만큼 밀려난다(로고가 큰 꼬리말에서 문구가 위로
+                            // 뜨던 원인). 글자처럼 취급하거나 위아래(TopAndBottom)로 자리를 차지하는
+                            // 그림, 그리고 자기 글자가 없어 줄이 그림 높이로 대신 자리를 잡던 문단만
+                            // 더한다.
+                            if pic.common.treat_as_char
+                                || !matches!(
+                                    pic.common.text_wrap,
+                                    TextWrap::BehindText | TextWrap::InFrontOfText
+                                )
+                                || !(has_page_auto_number || has_text)
+                            {
+                                let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                                y_offset += pic_h;
+                            }
                         }
                     }
-                    let has_page_auto_number = para.controls.iter().any(|ctrl| {
-                        matches!(
-                            ctrl,
-                            Control::AutoNumber(number)
-                                if matches!(
-                                    number.number_type,
-                                    crate::model::control::AutoNumberType::Page
-                                        | crate::model::control::AutoNumberType::TotalPage
-                                )
-                        )
-                    });
-                    layout_para_shapes(self, tree, area_node, false);
-                    // 떠 있는 그림 곁의 글자도 그린다. 쪽번호 필드(#7333)만 그리던 조건이
-                    // 일반 글자를 버려, 그림과 같은 문단에 놓인 꼬리말 문구가 사라졌다.
-                    // 쪽번호·총쪽수·파일이름 필드 표지(U+0015~0017)도 글자로 센다.
-                    let has_text = para.text.chars().any(|ch| {
-                        !ch.is_whitespace()
-                            && (!ch.is_control() || matches!(ch, '\u{0015}'..='\u{0017}'))
-                    });
+                    layout_para_shapes(self, tree, area_node, false, &mut floating_ids);
                     // 쪽번호 필드는 종전대로 문단 기준선(text_y)에서 그린다(#7333). 일반 글자는 위아래
                     // 자리를 차지하는(TopAndBottom) 그림이 같은 문단에 있으면 그림 아래에서 시작한다 —
                     // 그림 위에 겹쳐 그리지 않는다.
@@ -5094,7 +5159,29 @@ impl LayoutEngine {
                         y_offset = y_offset.max(text_end);
                     }
                 } else {
-                    // TAC Picture: layout_paragraph에서 인라인 배치
+                    // TAC Picture: layout_paragraph에서 인라인 배치. 같은 문단에 떠 있는 도형·그림이
+                    // 함께 있으면(회색 띠 + 오른쪽 로고 + 가운데 인라인 로고) 이 경로는 문단만 그려
+                    // 띠와 로고를 버렸다 — 글 뒤 도형·그림 → 문단 → 글 앞 그림·도형 순으로 그린다.
+                    // (글 앞 개체가 글 위에 오도록 문단 뒤에 그린다. 위 `if` 경로는 글을 마지막에
+                    // 그리는 종전 순서를 그대로 둔다.)
+                    layout_para_shapes(self, tree, area_node, true, &mut floating_ids);
+                    for (ci, ctrl) in para.controls.iter().enumerate() {
+                        if let Control::Picture(pic) = ctrl {
+                            if !pic.common.treat_as_char
+                                && matches!(pic.common.text_wrap, TextWrap::BehindText)
+                            {
+                                layout_floating_picture(
+                                    self,
+                                    tree,
+                                    area_node,
+                                    pic,
+                                    ci,
+                                    text_y,
+                                    &mut floating_ids,
+                                );
+                            }
+                        }
+                    }
                     y_offset = self.layout_paragraph(
                         tree,
                         area_node,
@@ -5109,6 +5196,24 @@ impl LayoutEngine {
                         Some(bin_data_content),
                         None, // 머리말/꼬리말 컨텍스트 — wrap zone 무관
                     );
+                    for (ci, ctrl) in para.controls.iter().enumerate() {
+                        if let Control::Picture(pic) = ctrl {
+                            if !pic.common.treat_as_char
+                                && !matches!(pic.common.text_wrap, TextWrap::BehindText)
+                            {
+                                layout_floating_picture(
+                                    self,
+                                    tree,
+                                    area_node,
+                                    pic,
+                                    ci,
+                                    text_y,
+                                    &mut floating_ids,
+                                );
+                            }
+                        }
+                    }
+                    layout_para_shapes(self, tree, area_node, false, &mut floating_ids);
                 }
             } else if has_shape {
                 // [#5802] 글자처럼 취급(TAC) 도형은 paragraph_layout 이 inline 좌표를
@@ -5209,6 +5314,7 @@ impl LayoutEngine {
                 break;
             }
         }
+        floating_ids
     }
 
     /// `BOTTOM` footer의 완전한 HWP5 저장 줄 grid가 갖는 첫 줄 선행 간격.
@@ -6451,6 +6557,8 @@ impl LayoutEngine {
         // HWP5(`parser/control.rs`)·HWPX(`parser/hwpx/section.rs` 의 `2 << 21`) 양쪽이
         // 같은 자리에 싣는다.
         let mut footer_valign: u32 = 0;
+        // 흐름에서 자리를 차지하지 않는(글 뒤·글 앞으로 떠 있는) 개체 노드 — 아래 맞춤의 내용 높이에서 뺀다.
+        let mut floating_ids: Vec<NodeId> = Vec::new();
         if !hidden {
             if let Some(hf_ref) = &page_content.active_footer {
                 {
@@ -6465,7 +6573,7 @@ impl LayoutEngine {
                                 outer_control_index: hf_ref.control_index,
                                 kind: crate::renderer::render_tree::HeaderFooterKind::Footer,
                             };
-                            self.layout_header_footer_paragraphs(
+                            floating_ids = self.layout_header_footer_paragraphs(
                                 tree,
                                 &mut footer_node,
                                 &footer.paragraphs,
@@ -6507,11 +6615,21 @@ impl LayoutEngine {
             let margin_footer =
                 (layout.page_height - (layout.footer_area.y + layout.footer_area.height)).max(0.0);
             let band_bottom = layout.footer_area.y + margin_footer;
-            let content_bottom = footer_node
-                .children
-                .iter()
-                .map(|c| c.bbox.y + c.bbox.height)
-                .fold(f64::MIN, f64::max);
+            // 글 뒤 회색 띠처럼 떠 있는 개체는 내용 높이에 넣지 않는다 — 띠가 밴드 아래로 길게 뻗어
+            // 있으면 여유가 없다고 보고 글을 밴드 위쪽에 붙여 두었다. 글만 있는 꼬리말과 같은 자리에
+            // 글이 놓이고, 개체는 앵커한 문단과 함께 움직인다. 떠 있는 개체뿐이면 종전대로 모두 잰다.
+            let flow_bottom = |skip_floating: bool| {
+                footer_node
+                    .children
+                    .iter()
+                    .filter(|c| !skip_floating || !floating_ids.contains(&c.id))
+                    .map(|c| c.bbox.y + c.bbox.height)
+                    .fold(f64::MIN, f64::max)
+            };
+            let content_bottom = match flow_bottom(true) {
+                bottom if bottom > f64::MIN => bottom,
+                _ => flow_bottom(false),
+            };
             let slack = band_bottom - content_bottom;
             // 내용이 밴드보다 크면 종전대로 위에서 시작한다 — 위로 밀어 올리지 않는다.
             let dy = if slack > 0.0 {
